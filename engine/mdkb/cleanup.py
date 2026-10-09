@@ -33,10 +33,13 @@ class Vocab:
     def __init__(self, words=None, compounds=None):
         self.words = words or set()
         self.compounds = compounds or set()
+        self.hyphen_space = 0      # 'dengue- like' inside a line
+        self.hyphen_tight = 0      # 'dengue-like'
 
     @classmethod
     def build(cls, texts: list[str]) -> "Vocab":
         words, comps = set(), set()
+        hs = ht = 0
         skip_first = False
         for t in texts:
             t2 = t
@@ -45,11 +48,15 @@ class Vocab:
             skip_first = bool(re.search(r"[A-Za-z]-\s*$", t))
             if skip_first:
                 t2 = re.sub(r"[A-Za-z]+-\s*$", "", t2)
+            hs += len(re.findall(r"[A-Za-z0-9]- (?=[A-Za-z0-9])", t2))
+            ht += len(re.findall(r"[A-Za-z0-9]-(?=[A-Za-z0-9])", t2))
             for w in re.findall(r"[A-Za-z]{2,}", t2):
                 words.add(w.lower())
             for m in re.finditer(r"(?<![\w-])([A-Za-z]{2,})-([A-Za-z]{2,})(?![\w-])", t2):
                 comps.add((m.group(1) + "-" + m.group(2)).lower())
-        return cls(words, comps)
+        v = cls(words, comps)
+        v.hyphen_space, v.hyphen_tight = hs, ht
+        return v
 
 
 def build_vocab(texts: list[str]) -> Vocab:
@@ -127,3 +134,61 @@ def normalize_margin(text: str) -> str:
 
 def is_page_number(text: str) -> bool:
     return bool(re.fullmatch(r"\s*(?:page\s*)?\d{1,5}\s*", text, re.I))
+
+
+_TH_MAP = {"te": "the", "tey": "they", "tem": "them", "tis": "this", "tat": "that", "tese": "these", "tose": "those", "tere": "there",
+           "tus": "thus", "terefore": "therefore", "terapy": "therapy", "terapeutic": "therapeutic", "tird": "third",
+           "trombocytopenia": "thrombocytopenia", "tyroid": "thyroid"}
+
+
+def repair_artifacts(text: str, vocab: "Vocab | None", log: list | None = None) -> str:
+    """Repair *font-encoding* artifacts only, and only with evidence from the same book:
+    - lost 'h' of a 'Th' ligature: only a fixed list of non-words ('Te' -> 'The', 'Tere' -> 'There', ...)
+    - 'ft' ligature mapped to '%':     'A%er' -> 'After'   when the result occurs elsewhere
+    - space after fi/fl ligature:      'confi rmed' -> 'confirmed'
+    Every repair is logged; the raw text is kept in the page state."""
+    if not vocab:
+        return text
+    words = vocab.words
+
+    def th(m):
+        w = m.group(0)
+        cand = _TH_MAP.get(w.lower())
+        if cand is None:
+            return w
+        cand = cand.capitalize() if w[0] == "T" else cand
+        if log is not None: log.append((w, cand))
+        return cand
+    text = re.sub(r"\bT(?:e|ey|em|is|at|ese|ose|ere|us|erefore|erapy|erapeutic|ird|rombocytopenia|yroid)\b", th, text)
+
+    def ft(m):
+        w = m.group(0)
+        cand = w.replace("%", "ft")
+        if cand.lower() in words:
+            if log is not None: log.append((w, cand))
+            return cand
+        return w
+    text = re.sub(r"\b[A-Za-z]*(?<=[A-Za-z])%(?=[a-z])[A-Za-z%]*\b", ft, text)
+
+    def fi(m):
+        left, right = m.group(1), m.group(2)
+        joined = (left + right).lower()
+        if joined in words or (left.lower() not in words and right.lower() not in words):
+            if log is not None: log.append((left + " " + right, left + right))
+            return left + right
+        return m.group(0)
+    text = re.sub(r"\b([A-Za-z]*(?:fi|fl|ffi|ffl|ff))\s([a-z]{2,})\b", fi, text)
+
+    # invisible space after a hyphen ("dengue- like", "2- 7 days"): only when this book does it consistently
+    if vocab.hyphen_space >= 5 and vocab.hyphen_space >= 3 * vocab.hyphen_tight:
+        def hs(m):
+            if m.group(2).lower() in ("and", "or", "to", "through", "versus", "vs"):
+                return m.group(0)                      # "pre- and postnatal": real suspended hyphen
+            if log is not None: log.append((m.group(0), m.group(1) + "-" + m.group(2)))
+            return m.group(1) + "-" + m.group(2)
+        text = re.sub(r"(?<![A-Za-z0-9])([A-Za-z0-9]+)- (?=[A-Za-z0-9])([A-Za-z0-9]+)", hs, text)
+    # decorative end-of-section glyph (U+2423) emitted by some publisher fonts
+    if "\u2423" in text:
+        if log is not None: log.append(("\u2423", ""))
+        text = re.sub(r"\s*\u2423", "", text)
+    return text

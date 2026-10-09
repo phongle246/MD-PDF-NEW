@@ -22,6 +22,7 @@ class RawBlock:
     page: int = 0
     column: int = 0
     order: int = 0
+    payload: object = None
 
     @property
     def size(self):
@@ -71,6 +72,8 @@ def extract_blocks(page) -> tuple[list[RawBlock], list[RawBlock]]:
         # split where line style changes (heading line vs body text) so headings never hide inside a block
         group = []
         for ln in lines:
+            if group and ln.bold and group[-1].bold and ln.text.strip().isupper() != group[-1].text.strip().isupper():
+                texts.append(_mk(group, page)); group = []
             if group and (abs(ln.size - group[-1].size) > 1.0 or (ln.bold != group[-1].bold and (ln.bold or group[-1].bold) and
                                                                    (len(ln.text) < 100 and len(group[-1].text) < 100 or ln.bold))):
                 texts.append(_mk(group, page)); group = []
@@ -97,9 +100,10 @@ def detect_columns(blocks: list[RawBlock], page_width: float):
     left = [b for b in body if b.bbox[2] <= mid + page_width * 0.04]
     right = [b for b in body if b.bbox[0] >= mid - page_width * 0.04]
     straddle = [b for b in body if b.bbox[0] < mid - page_width * 0.04 and b.bbox[2] > mid + page_width * 0.04]
-    if len(left) >= 2 and len(right) >= 2 and len(straddle) <= max(1, len(body) // 10):
-        gutter = (max(b.bbox[2] for b in left) + min(b.bbox[0] for b in right)) / 2
-        return gutter
+    if len(left) >= 1 and len(right) >= 1 and len(left) + len(right) >= 3 and len(straddle) <= max(1, len(body) // 10):
+        lx, rx = max(b.bbox[2] for b in left), min(b.bbox[0] for b in right)
+        if rx - lx >= 8:                                  # a real gutter, not touching blocks
+            return (lx + rx) / 2
     return None
 
 

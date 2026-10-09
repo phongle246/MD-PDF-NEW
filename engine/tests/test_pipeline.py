@@ -284,3 +284,55 @@ def test_low_confidence_chapters_flagged(tmp_path):
     from mdkb import chapters
     c = chapters.validate([Chapter(1, "A", 1, 5), Chapter(1, "B", 6, 9)], 10)
     assert all(x.confidence < 0.6 for x in c) and len(chapters.needs_review(c)) == 2
+
+
+def test_chapters_sharing_a_page(tmp_path):
+    pdf = fixtures.shared_page_book(tmp_path / "s.pdf")
+    p = Project.create(tmp_path / "ps", pdf, title="Test Book")
+    chs = {c.number: c for c in p.chapters()}
+    assert (chs[10].start_page, chs[10].end_page, chs[11].start_page, chs[11].end_page) == (1, 2, 2, 2)
+    pipeline.convert_chapter(p, 10); pipeline.convert_chapter(p, 11)
+    a, b = md_of(p, 10), md_of(p, 11)
+    assert "Complications are rare in 3% of children." in a and "Beta disorders" not in a          # chapter 10 ends at chapter 11's heading
+    assert "Beta disorders affect 12% of infants." in b and "Complications" not in b              # nothing from chapter 10 leaks in
+    assert "Chapter 10  Alpha" not in a and "# Beta Disorders" in b
+    assert "## OUTCOME" in a and "OUTCOME" not in b                                                 # previous chapter's tail heading does not leak
+    assert "\x01" not in a and "\x01" not in b                                                       # undecodable footer dropped
+
+
+def test_heading_levels_from_typography_and_byline(tmp_path):
+    pdf = fixtures.shared_page_book(tmp_path / "s.pdf")
+    p = Project.create(tmp_path / "ps", pdf, title="Test Book")
+    pipeline.convert_chapter(p, 10)
+    md = md_of(p, 10)
+    assert "\n## ETIOLOGY\n" in md and "\n## PROGNOSIS\n" in md and "\n### Clinical Course\n" in md   # same style -> same level
+    assert "*Jane Q. Author*" in md and "## Jane" not in md                                           # byline is not a heading
+
+
+def test_composite_figure_keeps_label_text(tmp_path):
+    pdf = fixtures.shared_page_book(tmp_path / "s.pdf")
+    p = Project.create(tmp_path / "ps", pdf, title="Test Book")
+    r = pipeline.convert_chapter(p, 10)
+    md = md_of(p, 10)
+    assert "<summary>Figure text / labels</summary>" in md and "- WARNING SIGNS" in md and "- Liver: AST >= 1000" in md
+    assert "Fig. 10.1 Case classification and severity levels." in md
+    assert (p.root / "assets/images/ch_010/figure_10_01.png").exists()
+    assert not [i for i in r["issues"] if i["code"] in ("FIGURE_NO_CAPTION", "CAPTION_NO_FIGURE", "TEXT_LOSS")]
+
+
+def test_font_encoding_artifacts_repaired_and_logged(tmp_path):
+    pdf = fixtures.shared_page_book(tmp_path / "s.pdf")
+    p = Project.create(tmp_path / "ps", pdf, title="Test Book")
+    r = pipeline.convert_chapter(p, 10)
+    md = md_of(p, 10)
+    assert "The disease is common. There are many cases." in md and "after onset" in md
+    assert any(i["code"] == "ARTIFACT_REPAIRED" for i in r["issues"])
+    assert not [i for i in r["issues"] if "NUMBER" in i["code"]]
+
+
+def test_junk_footer_does_not_break_two_column_order(tmp_path):
+    pdf = fixtures.two_column_with_junk_footer(tmp_path / "j.pdf")
+    p = Project.create(tmp_path / "pj", pdf, title="Junk")
+    pipeline.convert_chapter(p, 5)
+    md = md_of(p, 5)
+    assert md.index("Left column first") < md.index("Left column second") < md.index("Right column paragraph")

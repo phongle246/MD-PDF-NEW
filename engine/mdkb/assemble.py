@@ -43,6 +43,8 @@ class Assembled:
     tables: list[dict]
     figures: list[dict]
     unresolved_xref_candidates: list = field(default_factory=list)
+    excluded: list = field(default_factory=list)      # [(page, bbox)] source regions intentionally not in Markdown
+    repairs: list = field(default_factory=list)
 
 
 def _line_text(l):
@@ -101,8 +103,7 @@ def assemble(pages: list[dict], chapter, book_slug: str, vocab: cleanup.Vocab | 
     issues: list[dict] = []
     bsize = convention.get("body_size") or body_size(pages)
 
-    # ---- PASS 6a: collect heading sizes
-    cand_sizes = Counter()
+    # ---- PASS 6a: heading style ranking. A style = (font size, ALL-CAPS). Larger size ranks higher; at equal size ALL-CAPS ranks higher.
     title_norm = re.sub(r"\W+", "", chapter.title.lower())
 
     def is_title_block(p, b):
@@ -110,17 +111,33 @@ def assemble(pages: list[dict], chapter, book_slug: str, vocab: cleanup.Vocab | 
             return False
         raw_ = " ".join(l["text"] for l in b["lines"])
         norm = re.sub(r"\W+", "", raw_.lower())
-        return bool(re.match(r"^\s*chapter\s+\d+", raw_, re.I) or (title_norm and norm and len(norm) > 4 and (norm in title_norm or title_norm in norm)))
+        return bool(re.match(r"^\s*chapter\s+%d\b" % chapter.number, raw_, re.I) or (title_norm and norm and len(norm) > 4 and (norm in title_norm or title_norm in norm) and max(l["size"] for l in b["lines"]) >= bsize * 1.3))
 
+    # blocks at/after a different chapter's heading (reading order) are not part of this chapter: keep them out of style statistics
+    foreign: set[str] = set()
+    _stop, _seen = False, False
+    for p in pages:
+        for b in sorted(p["blocks"], key=lambda b: b["order"]):
+            if _stop:
+                foreign.add(b["id"]); continue
+            if b["kind"] == "text" and not b.get("ocr") and b["lines"] and not is_title_block(p, b):
+                m_ = re.match(r"^\s*chapter\s+(\d+)\b", b["lines"][0]["text"], re.I)
+                if m_ and int(m_.group(1)) != chapter.number and max(l["size"] for l in b["lines"]) >= bsize * 1.3 and _seen:
+                    _stop = True; foreign.add(b["id"]); continue
+                _seen = True
+
+    style_count = Counter()
     for p in pages:
         for b in p["blocks"]:
-            if b["kind"] == "text" and not b.get("ocr") and 0 < len(b["lines"]) <= 3 and not (is_title_block(p, b) and p["blocks"].index(b) < 3):
-                s = round(max(l["size"] for l in b["lines"]) * 2) / 2
-                txt = " ".join(l["text"] for l in b["lines"])
-                if s >= bsize * 1.12 and len(txt) <= 160:
-                    cand_sizes[s] += 1
-    sizes_desc = sorted(cand_sizes, reverse=True)
-    size_level = {s: min(2 + i, 4) for i, s in enumerate(sizes_desc)}
+            if b["id"] in foreign:
+                continue
+            if b["kind"] == "text" and not b.get("ocr") and 0 < len(b["lines"]) <= 3 and not is_title_block(p, b):
+                st = _heading_style(b["lines"], bsize)
+                if st:
+                    style_count[st] += 1
+    styles_ranked = sorted(style_count, key=lambda k: (-k[0], not k[1]))
+    size_level = {st: min(2 + i, 5) for i, st in enumerate(styles_ranked)}
+    sizes_desc = styles_ranked
 
     items: list[Out] = []
     used_ids: set[str] = set()
@@ -138,13 +155,34 @@ def assemble(pages: list[dict], chapter, book_slug: str, vocab: cleanup.Vocab | 
         items.append(o)
         return o
 
+    title_ids = {b["id"] for p in pages if p["page"] == chapter.start_page for b in p["blocks"] if is_title_block(p, b)}
+    excluded: list = []
+    repairs: list = []
+    stop = False
+    seen_title = False
+    next_ch = re.compile(r"^\s*chapter\s+(\d+)\b", re.I)
     for p in pages:
+        if stop:
+            for b in p["blocks"]:
+                excluded.append((p["page"], b["bbox"]))
+            continue
         pno = p["page"]
         blocks = sorted(p["blocks"], key=lambda b: b["order"])
         i = 0
         while i < len(blocks):
             b = blocks[i]
             i += 1
+            if stop:
+                excluded.append((pno, b["bbox"]))
+                continue
+            # a heading for a *different* chapter ends this chapter (chapters may share a page)
+            if b["kind"] == "text" and not b.get("ocr") and b["lines"] and not is_title_block(p, b):
+                m = next_ch.match(b["lines"][0]["text"])
+                if m and int(m.group(1)) != chapter.number and max(l["size"] for l in b["lines"]) >= bsize * 1.3 and (items or headings):
+                    stop = True
+                    excluded.append((pno, b["bbox"]))
+                    issues.append({"severity": "LOW", "code": "CHAPTER_BOUNDARY", "message": f"Content from page {pno} onward belongs to Chapter {m.group(1)} and was excluded here", "page": pno})
+                    continue
             if b["kind"] == "uncertain":
                 add("uncertain", f"<!-- UNCERTAIN: source text unreadable, page {pno} -->\n\n[Unreadable source text]", p, b, conf=0.0)
                 continue
@@ -152,7 +190,7 @@ def assemble(pages: list[dict], chapter, book_slug: str, vocab: cleanup.Vocab | 
                 if b.get("duplicate"):
                     continue
                 figures.append({"block": b, "page": pno})
-                add("figure", "", p, b, conf=b["confidence"], figure=len(figures) - 1)
+                add("figure", "", p, b, conf=b["confidence"], figure=len(figures) - 1, labels=b.get("labels") or [])
                 continue
             if b["kind"] == "table":
                 tables.append({"block": b, "page": pno})
@@ -169,8 +207,25 @@ def assemble(pages: list[dict], chapter, book_slug: str, vocab: cleanup.Vocab | 
                 continue
             first = lines[0]["text"].strip()
             # chapter title dropped on first page (title comes from outline/metadata)
-            if pno == chapter.start_page and not headings and all(x.kind == "chapter_title" for x in items) and is_title_block(p, b):
+            if b["id"] in title_ids:
+                if not seen_title:
+                    stale = [x for x in items if x.kind != "chapter_title"]
+                    items[:] = [x for x in items if x.kind == "chapter_title"]       # content before the chapter heading belongs to the previous chapter
+                    for x in stale:
+                        excluded.append((x.page, x.bbox))
+                    if stale:                                                        # their headings/refs/footnotes go too
+                        headings.clear(); heading_stack.clear(); used_ids.clear(); refs.clear(); footnotes.clear(); in_refs = False
+                    if stale:
+                        issues.append({"severity": "LOW", "code": "CHAPTER_BOUNDARY", "message": f"{len(stale)} block(s) before the chapter heading on page {pno} belong to the previous chapter and were excluded", "page": pno})
+                seen_title = True
                 add("chapter_title", "", p, b, raw=raw)
+                excluded.append((pno, b["bbox"]))
+                continue
+            # byline (authors) directly under the chapter title: keep as plain italic text, not a heading
+            if seen_title and not headings and all(x.kind == "chapter_title" for x in items) and len(lines) <= 2 and all(l["italic"] for l in lines) and len(raw) < 120:
+                add("paragraph", "*" + cleanup.join_lines([l["text"] for l in lines], vocab) + "*", p, b, raw=raw, byline=True)
+                seen_title = False
+                items[-1].extra["byline"] = True
                 continue
             # footnote: small font in lower page area, starting with number/symbol
             ph = p["height"]
@@ -184,8 +239,15 @@ def assemble(pages: list[dict], chapter, book_slug: str, vocab: cleanup.Vocab | 
                 continue
             # caption
             if CAPTION_RE.match(first):
-                txt = cleanup.join_lines([l["marked"] for l in lines], vocab)
+                txt = cleanup.repair_artifacts(cleanup.join_lines([l["marked"] for l in lines], vocab), vocab, repairs)
                 add("caption", txt, p, b, raw=raw, cleaned=txt, caption=CAPTION_RE.match(first).groups())
+                continue
+            # caption continuation: short unstyled block directly under a caption that does not end its sentence
+            if items and items[-1].kind == "caption" and items[-1].page == pno and len(lines) <= 2 and not lines[0]["bold"] \
+                    and 0 <= b["bbox"][1] - items[-1].bbox[3] < 6 and not items[-1].md.rstrip().endswith((".", ")")) and items[-1].extra.get("cont", 0) < 2:
+                items[-1].md = cleanup.join_lines([items[-1].md] + [l["marked"] for l in lines], vocab)
+                items[-1].raw += "\n" + raw
+                items[-1].extra["cont"] = items[-1].extra.get("cont", 0) + 1
                 continue
             # callout keyword
             if CALLOUT_RE.match(first) and (b["lines"][0]["bold"] or first.isupper() or b.get("box", -1) >= 0):
@@ -239,7 +301,7 @@ def assemble(pages: list[dict], chapter, book_slug: str, vocab: cleanup.Vocab | 
                 continue
 
             # lists / paragraphs
-            rendered = _render_groups(lines, b, vocab, issues, pno)
+            rendered = cleanup.repair_artifacts(_render_groups(lines, b, vocab, issues, pno), vocab, repairs)
             kind = "list" if any(g["kind"] == "item" for g in _paragraph_groups(b)) and all(g["kind"] == "item" for g in _paragraph_groups(b)) else "paragraph"
             o = add(kind, rendered, p, b, raw=raw, conf=1.0)
             o.extra["x0"] = min(l["x0"] for l in lines)
@@ -274,23 +336,39 @@ def assemble(pages: list[dict], chapter, book_slug: str, vocab: cleanup.Vocab | 
         o.extra["heading_path"] = [h[1] for h in stack]
         o.extra["section_id"] = sid
 
-    return Assembled(items, issues, headings, refs, footnotes, tables, figures)
+    A = Assembled(items, issues, headings, refs, footnotes, tables, figures)
+    A.excluded, A.repairs = excluded, repairs
+    return A
 
 
-def _detect_heading(b, lines, bsize, size_level, sizes_desc):
+def _heading_style(lines, bsize):
+    """Return the heading style key (size, all_caps) if the block looks like a heading by typography, else None."""
     if len(lines) > 3:
         return None
     text = " ".join(l["text"] for l in lines).strip()
-    if not text or len(text) > 160 or BULLET_RE.match(text) and not text[0].isalnum():
+    if not text or len(text) > 160 or (BULLET_RE.match(text) and not text[0].isalnum()):
         return None
     size = round(max(l["size"] for l in lines) * 2) / 2
-    if size >= bsize * 1.12 and size in size_level and not text.endswith((".", ",")) or (size >= bsize * 1.12 and size in size_level and len(text) < 90 and not text.endswith(",")):
-        return size_level[size], 0.92
     allbold = all(l["bold"] for l in lines)
-    if allbold and len(lines) <= 2 and len(text) < 100 and not text.endswith((".", ",", ";")) and not CAPTION_RE.match(text) and not NUM_RE.match(text):
-        lvl = min((max(size_level.values()) if size_level else 2) + 1, 5)
-        return lvl, 0.7
-    return None
+    big = size >= bsize * 1.12
+    if all(l["italic"] for l in lines) and not allbold:
+        return None                                  # italic-only lines (bylines, species names) are not headings
+    if not (big or (allbold and size >= bsize * 0.98)):
+        return None
+    if text.endswith((",", ";")) or (not big and text.endswith(".")) or CAPTION_RE.match(text) or NUM_RE.match(text):
+        return None
+    if not big and (len(lines) > 2 or len(text) > 100):
+        return None
+    letters = [c for c in text if c.isalpha()]
+    return (size, bool(letters) and all(c.isupper() for c in letters))
+
+
+def _detect_heading(b, lines, bsize, size_level, sizes_desc):
+    st = _heading_style(lines, bsize)
+    if st is None or st not in size_level:
+        return None
+    big = st[0] >= bsize * 1.12
+    return size_level[st], (0.92 if big else 0.8)
 
 
 def _render_groups(lines, block, vocab, issues, pno) -> str:

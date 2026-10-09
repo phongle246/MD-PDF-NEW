@@ -10,6 +10,15 @@ MIN_NATIVE_CHARS = 25
 FIG_MIN = 40.0
 
 
+def _is_junk(text: str) -> bool:
+    """Margin text that is mostly control / private-use glyphs (e.g. an image-backed copyright line with no text map)."""
+    chars = [c for c in text if not c.isspace()]
+    if not chars:
+        return False
+    bad = sum(1 for c in chars if ord(c) < 32 or 0xE000 <= ord(c) <= 0xF8FF or c == "\ufffd")
+    return bad / len(chars) >= 0.25
+
+
 def _inside(inner, outer, frac=0.6) -> bool:
     ix0, iy0 = max(inner[0], outer[0]), max(inner[1], outer[1])
     ix1, iy1 = min(inner[2], outer[2]), min(inner[3], outer[3])
@@ -100,20 +109,24 @@ def process_page(page, ch_no: int, margins: set[str], assets_dir: Path, fig_coun
     # --- PASS 2/3: layout + reading order (text blocks outside tables)
     boxes = _shaded_boxes(page)
     body = []
+    texts = [b for b in texts if not any(_inside(b.bbox, tb, 0.5) for tb in table_bboxes)]
+    composites, claimed = _composite_figures(page, texts, images, table_bboxes, ph)
     for b in texts:
-        if any(_inside(b.bbox, tb, 0.5) for tb in table_bboxes):
+        if id(b) in claimed:
             continue
         # margin / page-number removal (running headers, footers)
         if b.bbox[1] < ph * 0.08 or b.bbox[3] > ph * 0.92:
             keys = [cleanup.normalize_margin(l.text) for l in b.lines]
-            if all((k in margins) or cleanup.is_page_number(l.text) for k, l in zip(keys, b.lines)):
+            junk = _is_junk(" ".join(l.text for l in b.lines))
+            running = junk or (re.match(r"^\s*chapter\s+\d+\b", b.lines[0].text, re.I) is not None and b.bbox[1] < ph * 0.08)
+            if running or all((k in margins) or cleanup.is_page_number(l.text) for k, l in zip(keys, b.lines)):
                 dropped.append(list(b.bbox))
                 continue
         body.append(b)
 
     # figures: image blocks that are big enough
-    figs = [im for im in images if (im.bbox[2] - im.bbox[0]) >= FIG_MIN and (im.bbox[3] - im.bbox[1]) >= FIG_MIN]
-    items = body + [layout.RawBlock(t, [], "table", pno) for t in table_bboxes] + figs
+    figs = [im for im in images if id(im) not in claimed and (im.bbox[2] - im.bbox[0]) >= FIG_MIN and (im.bbox[3] - im.bbox[1]) >= FIG_MIN]
+    items = body + [layout.RawBlock(t, [], "table", pno) for t in table_bboxes] + figs + composites
     ordered = layout.order_blocks(items, pw)
 
     # --- PASS 4: extraction into serialisable blocks
@@ -135,8 +148,10 @@ def process_page(page, ch_no: int, margins: set[str], assets_dir: Path, fig_coun
             md, info = tbl.serialise(rows)
             state["blocks"].append({**base, "kind": "table", "rows": [[tbl._cell(c) for c in r] for r in rows], "markdown": md,
                                     "table_info": info, "confidence": 0.6 if info["complex"] else 0.9})
-        elif b.kind == "image":
+        elif b.kind in ("image", "composite"):
             fig = {**base, "kind": "figure", "confidence": 0.9}
+            if b.kind == "composite":
+                fig["labels"] = b.payload["labels"]; fig["composite"] = True; fig["confidence"] = 0.8
             if save_images:
                 png = _render_clip(page, b.bbox)
                 h = hashlib.sha1(png).hexdigest()
@@ -152,9 +167,6 @@ def process_page(page, ch_no: int, margins: set[str], assets_dir: Path, fig_coun
                     fig["image"] = fn
             state["blocks"].append(fig)
 
-    # vector figures (no raster): drawings cluster above a "Figure" caption without image
-    _vector_figures(page, state, ch_no, assets_dir, fig_counter, fig_hashes, save_images)
-
     # independent source text for numeric/word QA: words not in dropped regions
     words = page.get_text("words")
     kept = []
@@ -164,41 +176,78 @@ def process_page(page, ch_no: int, margins: set[str], assets_dir: Path, fig_coun
             continue
         kept.append(cleanup.normalize_chars(w[4]))
     state["src_text"] = " ".join(kept)
+    state["src_words"] = [[round(w[0], 1), round(w[1], 1), round(w[2], 1), round(w[3], 1), cleanup.normalize_chars(w[4])] for w in words
+                          if not any(d[0] <= (w[0] + w[2]) / 2 <= d[2] and d[1] <= (w[1] + w[3]) / 2 <= d[3] for d in dropped)]
     state["dropped"] = dropped
     return state
 
 
-def _vector_figures(page, state, ch_no, assets_dir, fig_counter, fig_hashes, save_images):
-    caps = [b for b in state["blocks"] if b["kind"] == "text" and b["lines"]
-            and re.match(r"^\s*(Figure|Fig\.)\s+\d", b["lines"][0]["text"])]
+_CAP_FIG = re.compile(r"^\s*(Figure|Fig\.)\s+\d")
+
+
+def _composite_figures(page, texts, images, table_bboxes, ph):
+    """Figures built from several image fragments / vector drawings with live text labels.
+    The region next to a 'Fig. N' caption is rendered as one PNG; the label text is kept (not dropped) as figure text."""
+    caps = [b for b in texts if b.lines and _CAP_FIG.match(b.lines[0].text)]
     if not caps:
-        return
+        return [], set()
     try:
-        drawings = [d["rect"] for d in page.get_drawings() if d["rect"].width > 2 and d["rect"].height > 2]
+        drawings = [d["rect"] for d in page.get_drawings() if d["rect"].width > 2 and d["rect"].height > 2
+                    and not any(_inside(tuple(d["rect"]), tb, 0.5) for tb in table_bboxes)]
     except Exception:
-        return
+        drawings = []
+    out, claimed = [], set()
+    from collections import Counter as _Counter
+    _sz = _Counter()
+    for t in texts:
+        for l in t.lines:
+            _sz[round(l.size * 2) / 2] += len(l.text)
+    page_body = _sz.most_common(1)[0][0] if _sz else 10.0
     for cap in caps:
-        if any(b["kind"] == "figure" and abs(b["bbox"][3] - cap["bbox"][1]) < 60 for b in state["blocks"]):
+        cx0, cy0, cx1, cy1 = cap.bbox
+        low = cy1 - 330
+        for o in caps:                               # another caption above (overlapping columns) bounds the window
+            if o is not cap and o.bbox[3] <= cy0 and min(cx1, o.bbox[2]) - max(cx0, o.bbox[0]) > 0.5 * min(cx1 - cx0, o.bbox[2] - o.bbox[0]):
+                low = max(low, o.bbox[3])
+        frags = [im.bbox for im in images if id(im) not in claimed and im.bbox[3] <= cy1 + 15 and im.bbox[1] >= low]
+        frags += [tuple(r) for r in drawings if r.y1 <= cy1 + 15 and r.y0 >= low and not (r.x0 >= cx0 - 1 and r.y0 >= cy0 - 1)]
+        if not frags:
             continue
-        cx0, cy0, cx1, cy1 = cap["bbox"]
-        near = [r for r in drawings if r.y1 <= cy0 + 2 and r.y0 >= cy0 - 380 and r.x0 >= cx0 - 40 and r.x1 <= cx1 + 40]
-        if len(near) < 4:
+        ux0 = min(f[0] for f in frags); uy0 = min(f[1] for f in frags); ux1 = max(f[2] for f in frags); uy1 = max(f[3] for f in frags)
+        if ux1 - ux0 < FIG_MIN or uy1 - uy0 < 10:
             continue
-        x0 = min(r.x0 for r in near); y0 = min(r.y0 for r in near); x1 = max(r.x1 for r in near); y1 = max(r.y1 for r in near)
-        if x1 - x0 < FIG_MIN or y1 - y0 < FIG_MIN:
-            continue
-        bb = (x0 - 2, y0 - 2, x1 + 2, y1 + 2)
-        fig = {"id": cap["id"] + "-vf", "kind": "figure", "bbox": [round(v, 2) for v in bb], "order": cap["order"] - 0.5,
-               "column": cap["column"], "confidence": 0.7, "vector": True}
-        if save_images:
-            png = _render_clip(page, bb)
-            h = hashlib.sha1(png).hexdigest()
-            if h not in fig_hashes:
-                fig_hashes.add(h)
-                fig_counter["n"] += 1
-                fn = f"figure_tmp_{fig_counter['n']:03d}.png"
-                assets_dir.mkdir(parents=True, exist_ok=True)
-                (assets_dir / fn).write_bytes(png)
-                fig["image"] = fn
-        state["blocks"].append(fig)
-    state["blocks"].sort(key=lambda b: b["order"])
+        x_hi = max(ux1, cx1) + 5 if cx0 >= ux1 - 5 else ux1 + 15           # caption beside the figure widens the window
+        labels = [t for t in texts if t is not cap and id(t) not in claimed and not _CAP_FIG.match(t.lines[0].text)
+                  and (t.bbox[1] >= uy0 - 12 or (t.bbox[1] >= uy0 - 30 and max(l.size for l in t.lines) < page_body * 0.95 or t.bbox[1] >= uy0 - 30 and t.bbox[3] - t.bbox[1] < 14 and t.bbox[1] > low))
+                  and t.bbox[3] <= cy1 + 15 and t.bbox[0] >= ux0 - 50 and t.bbox[2] <= x_hi
+                  and not (t.bbox[0] >= cx0 - 1 and t.bbox[1] >= cy0 - 1 and t.bbox[3] <= cy1 + 1)]
+        if len(labels) < 1 and len(frags) < 3:
+            continue                                                       # plain single image: normal path
+        region = [ux0, uy0, ux1, uy1]
+        for t in labels:
+            region = [min(region[0], t.bbox[0]), min(region[1], t.bbox[1]), max(region[2], t.bbox[2]), max(region[3], t.bbox[3])]
+        rb = layout.RawBlock(tuple(region), [], "composite", page.number + 1)
+        lab = []
+        for t in sorted(labels, key=lambda t: (round(t.bbox[1] / 4), t.bbox[0])):
+            lines = [l.text.strip() for l in t.lines if l.text.strip()]
+            bul = [i for i, l in enumerate(lines) if re.match(r"^[•●▪■◦·‣○]", l)]
+            if bul:
+                cur = []
+                for l in lines:
+                    if re.match(r"^[•●▪■◦·‣○]\s*", l):
+                        cur.append(re.sub(r"^[•●▪■◦·‣○]\s*", "", l))
+                    elif cur:
+                        cur[-1] += " " + l
+                    else:
+                        cur.append(l)
+                lab += cur
+            else:
+                lab.append(" ".join(lines))
+        rb.payload = {"labels": lab}
+        for t in labels:
+            claimed.add(id(t))
+        for im in images:
+            if im.bbox[0] >= region[0] - 1 and im.bbox[2] <= region[2] + 1 and im.bbox[1] >= region[1] - 1 and im.bbox[3] <= region[3] + 1:
+                claimed.add(id(im))
+        out.append(rb)
+    return out, claimed

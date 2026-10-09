@@ -43,8 +43,12 @@ def from_outline(doc, level: int | None = None) -> list[Chapter]:
     return _dedupe(chapters)
 
 
+def _btext(b) -> str:
+    return " ".join(" ".join("".join(s["text"] for s in l["spans"]).split()) for l in b["lines"]).strip()
+
+
 def from_text_patterns(doc, max_pages: int | None = None) -> list[Chapter]:
-    """Find 'Chapter N Title' headings in large fonts at page tops."""
+    """Find 'Chapter N' headings in large type. Starts may be mid-page (chapters can share a page)."""
     found = []
     for pno in range(doc.page_count if max_pages is None else min(max_pages, doc.page_count)):
         page = doc[pno]
@@ -54,18 +58,33 @@ def from_text_patterns(doc, max_pages: int | None = None) -> list[Chapter]:
             continue
         body = sorted(sizes)[len(sizes) // 2]
         for b in d["blocks"]:
-            if b["type"] != 0 or b["bbox"][1] > page.rect.height * 0.35:
+            if b["type"] != 0:                                                 # running headers are excluded by the size test below
                 continue
-            txt = " ".join("".join(s["text"] for s in l["spans"]) for l in b["lines"]).strip()
+            txt = _btext(b)
             size = max((s["size"] for l in b["lines"] for s in l["spans"]), default=0)
             m = CH_RE.match(txt)
             if m and size >= body * 1.3:
-                found.append((pno + 1, int(m.group(1)), m.group(2).strip(" .:-–—"), txt))
+                title = m.group(2).strip(" .:-–—")
+                if not title:                                                  # title is in the next big block
+                    nxt = [x for x in d["blocks"] if x["type"] == 0 and x["bbox"][1] >= b["bbox"][3] - 1 and x["bbox"][1] - b["bbox"][3] < 40]
+                    nxt.sort(key=lambda x: x["bbox"][1])
+                    if nxt:
+                        n0 = nxt[0]
+                        if max(s["size"] for l in n0["lines"] for s in l["spans"]) >= body * 1.3:
+                            title = _btext(n0)
+                found.append((pno + 1, int(m.group(1)), title, txt, b["bbox"][1] > page.rect.height * 0.25))
                 break
     chapters = []
-    for i, (pg, num, title, full) in enumerate(found):
+    for i, (pg, num, title, full, mid) in enumerate(found):
         end = found[i + 1][0] - 1 if i + 1 < len(found) else doc.page_count
-        chapters.append(Chapter(num, title or full, pg, max(pg, end), 0.7 if title else 0.5, "heading-pattern"))
+        if i + 1 < len(found) and found[i + 1][4]:
+            end = found[i + 1][0]                                              # next chapter starts mid-page: shared page
+        c = Chapter(num, title or full, pg, max(pg, end), 0.8 if title else 0.5, "heading-pattern")
+        if mid and pg > 1:
+            c.notes.append("starts mid-page")
+        if i + 1 < len(found) and found[i + 1][4]:
+            c.notes.append("shares last page with next chapter")
+        chapters.append(c)
     return _dedupe(chapters)
 
 
@@ -96,7 +115,8 @@ def validate(chs: list[Chapter], page_count: int) -> list[Chapter]:
     nums = [c.number for c in chs]
     for i, c in enumerate(chs):
         c.end_page = min(c.end_page, page_count)
-        if i + 1 < len(chs) and c.end_page >= chs[i + 1].start_page and chs[i + 1].start_page > c.start_page:
+        shared = i + 1 < len(chs) and "shares last page with next chapter" in c.notes
+        if i + 1 < len(chs) and c.end_page >= chs[i + 1].start_page and chs[i + 1].start_page > c.start_page and not shared:
             c.end_page = chs[i + 1].start_page - 1
             c.notes.append("end page trimmed to next chapter start")
         if nums.count(c.number) > 1:

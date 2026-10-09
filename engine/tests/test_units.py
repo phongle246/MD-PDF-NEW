@@ -136,3 +136,14 @@ def test_reading_order_single_column():
 def test_slug_and_fingerprint():
     assert slugify("Cystic Fibrosis: Overview") == "cystic-fibrosis-overview"
     assert fingerprint("A  b\nC") == fingerprint("a b c")
+
+
+def test_repair_artifacts_conservative():
+    v = cleanup.build_vocab(["There is the test after that", "x- y a- b c- d e- f g- h"])
+    log = []
+    assert cleanup.repair_artifacts("Te cat. Tere A%er", v, log) == "The cat. There After"
+    assert cleanup.repair_artifacts("pre- and post", v) == "pre- and post"                    # real suspended hyphen kept
+    assert cleanup.repair_artifacts("Ten patients, Tan shoes", v) == "Ten patients, Tan shoes"  # real words untouched
+    assert cleanup.repair_artifacts("end␣", v) == "end"
+    tight = cleanup.build_vocab(["a-b c-d e-f g-h i-j k-l"])
+    assert cleanup.repair_artifacts("dengue- like", tight) == "dengue- like"                    # book does not do this: leave alone

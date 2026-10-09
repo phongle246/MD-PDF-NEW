@@ -123,7 +123,7 @@ The FTS DB is a cache: `POST /api/search/reindex` rebuilds it from `rag/chunks.j
 
 ## Tests
 ```bash
-cd engine && python -m pytest -q          # 53 tests
+cd engine && python -m pytest -q          # 59 tests
 cd app && npm run build                   # type-check + production build
 ```
 Covered: reading order, dehyphenation, line joining, heading/list/table/figure/callout output, table serialisation, source-page
@@ -132,7 +132,8 @@ resume after interruption (output identical to an uninterrupted run), scanned pa
 large-table chapters, HTTP API flows, encrypted/corrupt PDF errors. Fixtures are synthetic PDFs generated in `engine/tests/fixtures.py`.
 
 ## Known limitations (honest status)
-- **Not yet validated on a real Nelson PDF** — only on synthetic fixtures. Real textbooks will need layout tuning (`assemble._detect_heading`, `layout.detect_columns`); conversion memory is recorded but only body font size/running headers are reused today.
+- **Validated on one real chapter only** (Nelson-style Dengue/Yellow Fever extract: 2 columns, shared pages, composite figure, table). Other chapters/books will still need layout tuning (`assemble._heading_style`, `layout.detect_columns`). Conversion memory is recorded but only body font size and running headers are reused today.
+- Font-encoding repairs (`Te`→`The`, `A%er`→`After`, `dengue- like`→`dengue-like`, end-of-section `␣`) are deliberately conservative, evidence-based and logged as `ARTIFACT_REPAIRED`; raw text stays in `.mdkb/state`. Figure labels inside diagrams are kept as `<details>` text in best-effort reading order.
 - The **Tauri/Rust shell is scaffolded but was not compiled** in the build environment (missing GTK/WebKit system libs). The UI itself builds and was smoke-tested against the engine in a browser.
 - Formulas are preserved as extracted Unicode text; **LaTeX reconstruction is not implemented**. Text inside figures is not extracted (no `<details>` labels).
 - Tables spanning pages are not merged; rotated pages and RTL scripts are untested; only English is targeted.

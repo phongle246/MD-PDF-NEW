@@ -50,7 +50,9 @@ def convert_chapter(project: Project, number: int, progress_cb=None, should_stop
         pre = read_json(sdir / "prepass.json")
         if not pre:
             lines_by_page, heights = {}, {}
-            for p in page_nums:
+            # sample extra pages across the book so one-page / short chapters still reveal running headers and footers
+            extra = [] if doc.page_count <= len(page_nums) else [int(1 + i * (doc.page_count - 1) / 9) for i in range(10)]
+            for p in sorted(set(page_nums) | {x for x in extra if 1 <= x <= doc.page_count}):
                 pg = doc[p - 1]
                 lines_by_page[p] = pagepass.prepass_lines(pg)
                 heights[p] = pg.rect.height
@@ -156,6 +158,12 @@ def _finish(project: Project, ch, pages: list[dict], doc, progress_cb, ocr_enabl
             alt = f"Figure {ct[1]}.{ct[2]}" if cap is not None and ct[2] else "Figure"
             o.md = f"![{alt}]({'../' + img_dir_rel}/{fname})"
             o.extra["file"] = f"{img_dir_rel}/{fname}"
+            if o.extra.get("labels"):
+                det = "<details>\n<summary>Figure text / labels</summary>\n\n" + "\n".join(f"- {t}" for t in o.extra["labels"]) + "\n\n</details>"
+                if cap is not None:
+                    items[cap].md += "\n\n" + det
+                else:
+                    o.md += "\n\n" + det
         elif fb.get("image") is None:
             o.md = ""
             issues.append(Issue("HIGH", "FIGURE_FILE_MISSING", f"Figure image missing on page {o.page}", o.page, o.block_id))
@@ -275,15 +283,22 @@ def _finish(project: Project, ch, pages: list[dict], doc, progress_cb, ocr_enabl
     md_full = f"{fm}\n# {ch.title}\n<!-- section_id: {book_slug_id(project, ch)} -->\n\n{contents}{body_md}\n"
     # ---- PASS 12-14: QA
     _emit(progress_cb, chapter=number, stage=STAGES[6], page=ch.end_page, done=len(pages), total=len(pages))
-    src_text = " ".join(p.get("src_text", "") for p in pages)
-    # remove chapter title page text that we intentionally drop from body
-    drop_text = " ".join(" ".join(l["text"] for l in b.get("lines", [])) for p in pages for b in p["blocks"] if False)
-    chap_title_raw = " ".join(o.raw for o in items if o.kind == "chapter_title")
+    exc = A.excluded + [(o.page, o.bbox) for o in items if o.kind == "chapter_title"]
+    src_parts = []
+    for p in pages:
+        if "src_words" in p:
+            boxes = [bb for pg, bb in exc if pg == p["page"]]
+            src_parts.append(" ".join(w[4] for w in p["src_words"]
+                                      if not any(bb[0] - 1 <= (w[0] + w[2]) / 2 <= bb[2] + 1 and bb[1] - 1 <= (w[1] + w[3]) / 2 <= bb[3] + 1 for bb in boxes)))
+        else:
+            src_parts.append(p.get("src_text", ""))
+    src_text = cleanup.repair_artifacts(" ".join(src_parts), vocab)
+    chap_title_raw = ""
     src_for_qa = src_text
     # footnote markers we convert
     md_for_qa = body_md
-    issues += qa.numeric_qa(_minus_text(src_for_qa, chap_title_raw), md_for_qa)
-    issues += qa.fidelity_qa(qa.word_counter(src_for_qa) - qa.word_counter(chap_title_raw), qa.word_counter(md_for_qa))
+    issues += qa.numeric_qa(src_for_qa, md_for_qa)
+    issues += qa.fidelity_qa(qa.word_counter(src_for_qa), qa.word_counter(md_for_qa))
     issues += qa.structure_qa([(h[0], h[1]) for h in A.headings])
     issues += qa.citation_qa(body_md.split("<a id=\"ref-")[0], set(A.refs))
     tl = {p["page"]: len(p.get("src_text", "")) for p in pages}
@@ -300,6 +315,10 @@ def _finish(project: Project, ch, pages: list[dict], doc, progress_cb, ocr_enabl
     if expected_tabs > len(table_records):
         issues.append(Issue("HIGH", "TABLE_COUNT", f"{expected_tabs} table captions but {len(table_records)} tables extracted"))
     issues += _uncertain_issues(items)
+    if A.repairs:
+        from collections import Counter as _C
+        top = ", ".join(f"{a}→{b} ×{n}" for (a, b), n in _C(A.repairs).most_common(8))
+        issues.append(Issue("LOW", "ARTIFACT_REPAIRED", f"Font-encoding artifacts repaired ({len(A.repairs)}): {top}. Raw text kept in .mdkb page state."))
 
     status = qa.status_from(issues, any(t.get("review") for t in table_records))
 

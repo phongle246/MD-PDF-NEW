@@ -129,3 +129,57 @@ def single_column_pdf(path):
                         "in the middle of a paragraph, preserving 3.5% accuracy."])
     doc.save(path); doc.close()
     return path
+
+
+def shared_page_book(path):
+    """Two chapters sharing a page (chapter 2 starts mid-page), bold ALL-CAPS / Title Case headings at body size,
+    a composite figure (image fragments + live text labels) with a caption beside it, and font-encoding artifacts."""
+    doc = pymupdf.open()
+    # ---- page 1: chapter 10 start
+    p = doc.new_page(width=W, height=H)
+    p.insert_text((72, 40), "Chapter 10  Alpha Disorders", fontsize=10, fontname="helv")        # running header (small)
+    p.insert_text((72, 90), "Chapter 10", fontsize=16, fontname="hebo")
+    p.insert_text((72, 120), "Alpha Disorders", fontsize=21, fontname="hebo")
+    p.insert_text((72, 145), "Jane Q. Author", fontsize=12, fontname="heit")
+    _lines(p, 72, 160, ["Te disease is common. Tere are many cases. Alpha is rare- like", "beta. In 2- 7 days a%er onset fever occurs; a- b c- d e- f g- h."], size=9)
+    _lines(p, 72, 188, ["The disease starts after a cold, and there are other signs."], size=9)
+    p.insert_text((72, 220), "ETIOLOGY", fontsize=10, fontname="hebo")
+    _lines(p, 72, 235, ["Cause is unknown in 40% of cases."], size=9)
+    p.insert_text((72, 270), "Clinical Course", fontsize=10, fontname="hebo")
+    _lines(p, 72, 285, ["Fever lasts 5 days."], size=9)
+    p.insert_text((72, 320), "PROGNOSIS", fontsize=10, fontname="hebo")
+    _lines(p, 72, 335, ["Good in 95% of patients."], size=9)
+    # composite figure: fragments + text labels, caption to the right
+    p.draw_oval(pymupdf.Rect(100, 420, 300, 480), width=1)
+    p.draw_rect(pymupdf.Rect(100, 490, 300, 500), width=1)
+    p.draw_rect(pymupdf.Rect(100, 505, 200, 515), width=1)
+    p.insert_text((110, 440), "WARNING SIGNS", fontsize=7, fontname="helv")
+    p.insert_text((110, 530), "Shock (DSS) 2 organs", fontsize=7, fontname="helv")
+    p.insert_text((110, 545), "Liver: AST >= 1000", fontsize=7, fontname="helv")
+    p.insert_text((330, 520), "Fig. 10.1 Case classification", fontsize=8, fontname="helv")
+    p.insert_text((330, 531), "and severity levels.", fontsize=8, fontname="helv")
+    # ---- page 2: end of chapter 10, then chapter 11 begins mid-page
+    p = doc.new_page(width=W, height=H)
+    p.insert_text((72, 40), "Chapter 10  Alpha Disorders", fontsize=10, fontname="helv")
+    p.insert_text((72, 80), "OUTCOME", fontsize=10, fontname="hebo")
+    _lines(p, 72, 95, ["Complications are rare in 3% of children."], size=9)
+    p.insert_text((114, 770), "\x01\x02\x03\x04\x05\x06\x07\x08 \x01\x02\x03\x04\x05\x06\x07\x08\x01\x02\x03", fontsize=7, fontname="helv")
+    p.insert_text((72, 400), "Chapter 11", fontsize=16, fontname="hebo")
+    p.insert_text((72, 425), "Beta Disorders", fontsize=21, fontname="hebo")
+    _lines(p, 72, 470, ["Beta disorders affect 12% of infants."], size=9)
+    doc.save(path); doc.close()
+    return path
+
+
+def two_column_with_junk_footer(path):
+    """Single-page chapter: two columns plus a full-width undecodable footer line that must not hide the gutter."""
+    doc = pymupdf.open()
+    p = doc.new_page(width=W, height=H)
+    p.insert_text((72, 90), "Chapter 5", fontsize=16, fontname="hebo")
+    p.insert_text((72, 115), "Solo Chapter", fontsize=21, fontname="hebo")
+    _lines(p, 72, 160, wrap(["Left column first paragraph runs down the left side of the page and carries on for several lines of text."], 42), size=9)
+    _lines(p, 320, 160, wrap(["Right column paragraph must be read only after the entire left column has finished being read."], 42), size=9)
+    _lines(p, 72, 300, wrap(["Left column second paragraph sits below the first one in the same column of the page."], 42), size=9)
+    p.insert_text((114, 770), "\x01\x02\x03\x04\x05\x06\x07\x08 \x01\x02\x03\x04\x05\x06\x07\x08\x01\x02\x03", fontsize=7, fontname="helv")
+    doc.save(path); doc.close()
+    return path
