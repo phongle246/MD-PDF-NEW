@@ -1,0 +1,11 @@
+node_modules/
+dist/
+target/
+__pycache__/
+*.pyc
+.pytest_cache/
+.mdkb/
+*.egg-info/
+.venv/
+src-tauri/gen/
+_workspace/

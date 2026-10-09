@@ -1,0 +1,11 @@
+{
+  "name": "md-pdf-new",
+  "private": true,
+  "scripts": {
+    "engine": "cd engine && python -m mdkb serve",
+    "app:dev": "npm --prefix app run dev",
+    "app:build": "npm --prefix app run build",
+    "test": "cd engine && python -m pytest -q",
+    "tauri": "cd app && npx tauri"
+  }
+}
